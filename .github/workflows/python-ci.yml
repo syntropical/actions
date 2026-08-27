@@ -1,0 +1,276 @@
+name: Python CI (reusable)
+
+# The fleet's shared Python CI. Callers reduce to ~10 lines; everything uniform lives here.
+#
+# WHY THIS EXISTS. The same ci.yml was copied across the fleet — byte-identical (md5
+# 77e39a47…) in six repos — so every fix had to be made N times and every mistake
+# propagated N times. Measured on this fleet:
+#   * a `curl … || echo "passed"` health check was ONE defect in THIRTEEN files
+#   * `ref: ${{ github.base_ref || github.ref_name }}` was independently reinvented in 4+
+#     repos, all broken the same way (infrastructure@main has no packages/ directory)
+#   * one wrong instruction about UV_INDEX_STRATEGY reached 6 sites in 5 repos in minutes
+# One definition means one place to be wrong, and one place to fix it.
+#
+# WHAT IT DELIBERATELY DOES NOT OWN. `on:` triggers cannot live in a reusable workflow —
+# they stay in the caller, and they are load-bearing: two repos in this fleet have CI that
+# triggers only on `main` while their branches are cut from `dev`, so their tests never run
+# at all. Centralising this file does not fix that; check your caller's triggers.
+#
+# CONSUMING IT — the `permissions:` block is REQUIRED on the caller, not optional:
+#   jobs:
+#     ci:
+#       permissions:
+#         contents: read
+#         id-token: write       # MANDATORY — see below
+#       uses: DelectableAI/infrastructure/.github/workflows/python-ci.yml@v1
+#       with:
+#         environment: gcp-dev
+#         test-path: src/pim/tests/
+#         lint-path: src/
+#       secrets: inherit          # or map explicitly, see `secrets:` below
+#
+# WHY THE CALLER MUST GRANT id-token: write. A called workflow can never hold MORE
+# permission than its caller. Fleet repos default GITHUB_TOKEN to `read`, so a caller that
+# omits the block caps this workflow at read — and the `id-token: write` requested below
+# (needed for the Workload Identity exchange that reaches Artifact Registry) exceeds that
+# cap. The run then fails as `startup_failure`: no jobs, no logs, no annotation naming the
+# cause. It does NOT degrade to a partial run. Verified on pim PR #17.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: >
+          GitHub Environment to run in. OPTIONAL for authentication — set it only when the
+          repo has genuine per-environment config overrides.
+
+          CORRECTION, 2026-07-28: an earlier version of this description claimed
+          GCP_WIF_PROVIDER / GCP_DEPLOY_SA were ENVIRONMENT secrets and that this input was
+          therefore required. That was wrong, and it was inferred from an empty
+          `gh secret list` without checking the org. They are ORGANIZATION secrets, and
+          `secrets: inherit` delivers them regardless of environment. Measured across all
+          nine repos that use these names — repo-level: 0, gcp-dev environment: 0,
+          organization: both present.
+
+          The check that settles it, since `gh secret list` alone misleads:
+            gh api repos/DelectableAI/<repo>/actions/secrets                --jq .total_count
+            gh api repos/DelectableAI/<repo>/environments/gcp-dev/secrets   --jq .total_count
+            gh api repos/DelectableAI/<repo>/actions/organization-secrets   --jq '[.secrets[].name]'
+
+          What IS required for repos whose secrets use DIFFERENT names (ads, social,
+          grocery-agent carry repo-level GCP_WORKLOAD_IDENTITY_PROVIDER /
+          GCP_SERVICE_ACCOUNT_DEV) is an explicit `secrets:` mapping — `secrets: inherit`
+          silently yields empty values when the names do not match.
+        type: string
+        required: false
+        default: ''
+      python-version:
+        type: string
+        required: false
+        default: '3.13'
+      installer:
+        description: 'pip | uv — how this repo installs. Affects nothing else.'
+        type: string
+        required: false
+        default: 'pip'
+      install-command:
+        description: 'Override the install entirely. Leave empty for the installer default.'
+        type: string
+        required: false
+        default: ''
+      lint-path:
+        description: 'One or more space-separated paths, e.g. "src" or "src tests".'
+        type: string
+        required: false
+        default: 'src/'
+      lint-select:
+        description: >
+          Ruff rules. Defaults to CORRECTNESS ONLY. This is deliberate: repos in this fleet
+          carry thousands of style findings (governance 1956, pim 5400), and a gate that
+          cannot pass is a gate that teaches people to ignore red. F821 is included because
+          it catches undefined names — three live NameErrors in production code were found
+          this way, including one that raised on every call of a shipped function.
+        type: string
+        required: false
+        default: 'E9,F63,F7,F821'
+      test-path:
+        description: >
+          Space-separated paths, or EMPTY to let pytest discover via its own config
+          (testpaths/rootdir). Empty is a supported value, not an oversight.
+        type: string
+        required: false
+        default: 'tests/'
+      test-args:
+        type: string
+        required: false
+        default: '-q --tb=short'
+      pythonpath:
+        type: string
+        required: false
+        default: ''
+      require-sdk:
+        description: 'Assert platform-sdk resolved from Artifact Registry (not the PyPI squat).'
+        type: boolean
+        required: false
+        default: true
+      sdk-min-version:
+        type: string
+        required: false
+        default: '0.5'
+      # NO tenant-specific defaults here. This file is PUBLIC so that callers in
+      # any org can reference it (GitHub resolves `uses:` at compile time and a
+      # private reusable workflow is unreachable across orgs). A hardcoded
+      # default would publish a tenant's GCP project name to the open internet.
+      # Empty means "resolve from org vars AR_PROJECT / AR_REPO"; see the
+      # Configure step, which fails loudly rather than building a half-formed URL.
+      ar-project:
+        type: string
+        required: false
+        default: ''
+      ar-repo:
+        type: string
+        required: false
+        default: ''
+      ar-location:
+        type: string
+        required: false
+        default: 'us-central1'
+    secrets:
+      # Declared explicitly rather than relying on `secrets: inherit`, because the fleet
+      # uses TWO naming conventions and inherit only works when names already match:
+      #   9 repos : GCP_WIF_PROVIDER / GCP_DEPLOY_SA                 (environment-scoped)
+      #   3 repos : GCP_WORKLOAD_IDENTITY_PROVIDER / GCP_SERVICE_ACCOUNT_DEV (repo-level)
+      # Callers in the second group map their names onto these. That is a two-line mapping
+      # in the caller and needs no org-admin secret rename.
+      GCP_WIF_PROVIDER:
+        required: false
+      GCP_DEPLOY_SA:
+        required: false
+
+jobs:
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    # id-token is what google-github-actions/auth exchanges for GCP credentials via
+    # workload identity federation, to reach the private Artifact Registry index.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install uv
+        if: inputs.installer == 'uv'
+        uses: astral-sh/setup-uv@v4
+
+      - name: Authenticate to Google Cloud
+        if: inputs.require-sdk
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        if: inputs.require-sdk
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Artifact Registry index
+        if: inputs.require-sdk
+        # The token is MASKED before it is interpolated into an index URL. Without this an
+        # installer that echoes its resolved index — several do on error — prints a live
+        # GCP access token into a public build log.
+        #
+        # NOTE there is deliberately NO uv --index-strategy flag. uv's default
+        # (first-index-match) is a dependency-confusion DEFENCE, and the extra index is
+        # searched first, so Artifact Registry already wins. Measured 2026-07-27 against
+        # this index: default resolves platform-sdk 0.5.0 fine; default REFUSES the PyPI
+        # name-squat with "uv will only consider versions published on the first index that
+        # contains a given package, to avoid dependency confusion attacks"; and
+        # unsafe-best-match INSTALLS that squat, which ships no platform_sdk module at all.
+        # Adding the flag downgrades index isolation to a bare version floor. Do not add it.
+        env:
+          AR_LOCATION: ${{ inputs.ar-location }}
+          AR_PROJECT: ${{ inputs.ar-project != '' && inputs.ar-project || vars.AR_PROJECT }}
+          AR_REPO: ${{ inputs.ar-repo != '' && inputs.ar-repo || vars.AR_REPO }}
+        run: |
+          set -euo pipefail
+          # Fail on an unset registry rather than composing
+          # "https://...@us-central1-python.pkg.dev///simple/", which pip accepts
+          # and then reports as a resolution failure naming a package instead of a
+          # missing setting.
+          if [ -z "${AR_PROJECT:-}" ] || [ -z "${AR_REPO:-}" ]; then
+            echo "::error::Artifact Registry not configured: set org/repo variables AR_PROJECT and AR_REPO (or pass ar-project / ar-repo). require-sdk is true, so this build needs the private index."
+            exit 1
+          fi
+          TOK=$(gcloud auth print-access-token)
+          echo "::add-mask::$TOK"
+          URL="https://oauth2accesstoken:${TOK}@${AR_LOCATION}-python.pkg.dev/${AR_PROJECT}/${AR_REPO}/simple/"
+          echo "PIP_EXTRA_INDEX_URL=${URL}" >> "$GITHUB_ENV"
+          echo "UV_EXTRA_INDEX_URL=${URL}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        # Inputs come through `env:`, never interpolated straight into the script body.
+        # Two reasons, one of which already bit: an EMPTY `${{ inputs.install-command }}`
+        # rendered `if [ -n "" ]; then` followed by nothing, and bash rejects an empty
+        # branch — "syntax error near unexpected token `elif`". actionlint passes this
+        # cleanly, because it lints the YAML and the expressions, not the shell those
+        # expressions render into. The second reason is that direct interpolation of an
+        # input into `run:` is a script-injection seam.
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+          INSTALLER: ${{ inputs.installer }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INSTALL_COMMAND" ]; then
+            eval "$INSTALL_COMMAND"
+          elif [ "$INSTALLER" = "uv" ]; then
+            uv pip install --system -e ".[dev]"
+          else
+            python -m pip install --upgrade pip
+            pip install -e ".[dev]"
+          fi
+
+      - name: Assert the real platform-sdk resolved
+        if: inputs.require-sdk
+        # MANDATORY when the SDK is required. The PyPI name-squat installs cleanly and
+        # ships NO platform_sdk module, so a zero exit from the installer proves nothing —
+        # this is the check that fails loudly instead of surfacing three steps later as an
+        # unrelated ImportError.
+        env:
+          SDK_MIN_VERSION: ${{ inputs.sdk-min-version }}
+        run: |
+          python - <<'EOF'
+          import os, sys, platform_sdk
+          from platform_sdk import health, selftest, control_defaults, verification  # noqa: F401
+          want = tuple(int(x) for x in os.environ["SDK_MIN_VERSION"].split("."))
+          got = tuple(int(x) for x in platform_sdk.__version__.split(".")[:len(want)])
+          if got < want:
+              sys.exit(f"platform-sdk {platform_sdk.__version__} < required {'.'.join(map(str,want))}")
+          print(f"platform-sdk {platform_sdk.__version__} OK (fleet contract surface importable)")
+          EOF
+
+      - name: Lint
+        env:
+          LINT_PATH: ${{ inputs.lint-path }}
+          LINT_SELECT: ${{ inputs.lint-select }}
+        # shellcheck disable=SC2086  # LINT_PATH may name SEVERAL paths ("src tests") and
+        # must word-split; quoting it turns them into one nonexistent path.
+        run: ruff check $LINT_PATH --select="$LINT_SELECT" --statistics
+
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ inputs.pythonpath }}
+          TEST_PATH: ${{ inputs.test-path }}
+          TEST_ARGS: ${{ inputs.test-args }}
+        # shellcheck disable=SC2086  # both must word-split: TEST_ARGS carries several flags,
+        # and TEST_PATH may be EMPTY (repos that rely on pytest's own discovery) or name
+        # several paths. Quoting it would pass "" as a literal path and pytest would fail.
+        run: pytest $TEST_PATH $TEST_ARGS
