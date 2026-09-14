@@ -39,6 +39,20 @@ name: Python CI (reusable)
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >
+          Runner label(s) for the lint/test job. Defaults to ubuntu-latest, so
+          every existing caller is unaffected. Set to 'self-hosted' (or a more
+          specific label) to move one repo onto the fleet's own runner —
+          see infrastructure/_standards/SELF-HOSTED-RUNNERS.md.
+
+          Note the failure mode before switching a critical path: a job asking
+          for a label no ONLINE runner carries does not fail, it QUEUES, for up
+          to 24 hours. An offline self-hosted runner therefore looks like a hung
+          CI run rather than a broken one.
+        type: string
+        default: 'ubuntu-latest'
+        required: false
       environment:
         description: >
           GitHub Environment to run in. OPTIONAL for authentication — set it only when the
@@ -150,7 +164,9 @@ on:
 jobs:
   lint-test:
     name: Lint & Test
-    runs-on: ubuntu-latest
+    # A plain string, so a caller can pass one label. A caller needing a label
+    # SET can pass a JSON array as the string and GitHub will accept it.
+    runs-on: ${{ inputs.runs-on }}
     environment: ${{ inputs.environment }}
 
     # id-token is what google-github-actions/auth exchanges for GCP credentials via
@@ -166,6 +182,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
+          # Every run re-downloaded the full dependency set from PyPI. Caching
+          # the pip directory keyed on the dependency declaration cuts the
+          # install step to a restore on any run whose deps have not changed,
+          # which is nearly all of them. Costs nothing when it misses.
+          #
+          # `cache: pip` needs a dependency file to hash or it errors, and repos
+          # in this fleet declare deps in pyproject.toml rather than a
+          # requirements.txt, so the path is named explicitly.
+          cache: ${{ inputs.installer == 'pip' && 'pip' || '' }}
+          cache-dependency-path: pyproject.toml
 
       - name: Install uv
         if: inputs.installer == 'uv'
