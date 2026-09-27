@@ -197,6 +197,26 @@ jobs:
         if: inputs.installer == 'uv'
         uses: astral-sh/setup-uv@v4
 
+      - name: Isolate the environment (per-job virtualenv)
+        # setup-python hands every job the SAME interpreter out of the runner's tool cache.
+        # On GitHub-hosted runners that is harmless — the VM is thrown away. On the fleet's
+        # self-hosted runners it is not: three runner instances in one container share
+        # /opt/hostedtoolcache, so every repo's job installs into, and uninstalls from, one
+        # site-packages. Measured 2026-09-27: pip reported platform-fleet-sdk 0.9.3 "already
+        # satisfied" while the platform_sdk module itself had been deleted by another job,
+        # and calendar/db/sourcing/workflow/scheduling/party all failed the SDK assertion
+        # below with ModuleNotFoundError on PRs that only added a text file.
+        #
+        # A venv under RUNNER_TEMP is per runner instance and wiped per job, so nothing a
+        # job installs survives it or leaks into a concurrent one. It is prepended to PATH,
+        # so python, pip, ruff and pytest in every later step resolve inside it.
+        run: |
+          set -euo pipefail
+          VENV="$RUNNER_TEMP/ci-venv"
+          python -m venv --clear "$VENV"
+          echo "VIRTUAL_ENV=$VENV" >> "$GITHUB_ENV"
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+
       - name: Authenticate to Google Cloud
         if: inputs.require-sdk
         uses: google-github-actions/auth@v2
@@ -258,7 +278,8 @@ jobs:
           if [ -n "$INSTALL_COMMAND" ]; then
             eval "$INSTALL_COMMAND"
           elif [ "$INSTALLER" = "uv" ]; then
-            uv pip install --system -e ".[dev]"
+            # Into the job's venv, not --system (the shared tool-cache interpreter).
+            uv pip install --python "$VIRTUAL_ENV/bin/python" -e ".[dev]"
           else
             python -m pip install --upgrade pip
             pip install -e ".[dev]"
