@@ -1,0 +1,33 @@
+name: Self-test
+
+# Tests the shared workflows in this repo before callers pick them up.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pytest==8.3.5 pyyaml==6.0.2
+      - run: python -m pytest scripts/sdlc/tests -q
+
+  # Dogfood: run this PR's own secure-sdlc.yml, with the gate script from this
+  # PR's commit, against this repo.
+  secure-sdlc:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/secure-sdlc.yml
+    with:
+      mode: enforce
+      actions-ref: ${{ github.event.pull_request.head.sha || github.sha }}
