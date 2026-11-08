@@ -1,0 +1,289 @@
+name: Secure SDLC (reusable)
+
+# The fleet's shared secure-development gate: secrets, SAST, dependency
+# vulnerabilities (SCA), licences, IaC configuration, action pinning and DCO
+# sign-off, evaluated by one policy (scripts/sdlc/sdlc_gate.py) against one
+# exception register (.security/exceptions.yaml in the calling repo).
+#
+# Maps to NIST SP 800-218 (SSDF): PS.1 (protect code: DCO, pinning), PW.4 (vetted
+# components: SCA, licence), PW.7 / PW.8 (review and test: SAST, secrets), PW.9
+# (secure defaults: IaC). It produces a coverage statement in the job summary
+# and an `sdlc-evidence` artifact that the release attestation consumes.
+#
+# THIS FILE IS PUBLIC (callers in any org must be able to resolve it). Keep it
+# tenant-neutral: no project ids, no org names, no internal URLs.
+#
+# SUPPLY CHAIN OF THE GATE ITSELF. No third-party marketplace actions run here
+# apart from actions/* (GitHub-owned). Scanners are installed by exact version:
+# Go binaries are checked against a pinned SHA-256; Python tools are installed
+# at an exact version into a throwaway virtualenv. Bump versions deliberately,
+# in a PR, and only to releases at least two weeks old.
+#
+# CONSUMING IT (caller, ~15 lines):
+#
+#   name: Secure SDLC
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main, stage]
+#   jobs:
+#     secure-sdlc:
+#       permissions:
+#         contents: read
+#       uses: syntropical/actions/.github/workflows/secure-sdlc.yml@v1
+#       with:
+#         mode: report          # report for the first week, then enforce
+#         actions-ref: v1       # keep equal to the @ref above
+#
+# ROLLOUT. Start every repo in `report` mode: everything runs, findings are
+# annotated, nothing blocks. Once a repo's backlog is dispositioned (fixed, or
+# entered in the exception register), switch to `enforce` and make the
+# `secure-sdlc / gate` check required in the branch ruleset.
+#
+# DIFF-AWARE ON PULL REQUESTS. Secrets and DCO are checked on the PR's commits;
+# SAST reports only findings introduced relative to the PR base. SCA, licence,
+# IaC and pinning always evaluate the whole tree, since a dependency or config
+# that was already vulnerable is still vulnerable.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label. Same semantics as python-ci.yml.
+        type: string
+        default: 'ubuntu-latest'
+      mode:
+        description: "report | enforce. report never fails on findings."
+        type: string
+        default: 'report'
+      actions-ref:
+        description: >
+          Ref of syntropical/actions to load the gate script from. Keep it equal
+          to the @ref in your `uses:` line; a called workflow cannot see its own ref.
+        type: string
+        default: 'v1'
+      python-version:
+        type: string
+        default: '3.12'
+      semgrep-config:
+        description: >
+          Space-separated semgrep configs. A `.semgrep/` directory in the calling
+          repo is added automatically when it exists.
+        type: string
+        default: 'p/default p/python p/typescript p/dockerfile p/github-actions'
+      sast-exclude:
+        description: Space-separated paths/globs excluded from SAST.
+        type: string
+        default: 'tests test node_modules .venv dist build vendor third_party'
+      block-at:
+        description: >
+          Per-gate blocking threshold overrides, e.g. "iac=unknown,dco=off".
+          Defaults: secrets=any, sast/sca/licence/iac=high, actions-pinning/dco=medium.
+        type: string
+        default: ''
+      trusted-action-owners:
+        description: Owners whose actions may be referenced by tag instead of SHA.
+        type: string
+        default: 'actions github syntropical'
+      enable-iac:
+        type: boolean
+        default: true
+      enable-dco:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: '8.30.1'
+  GITLEAKS_SHA256_X64: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+  GITLEAKS_SHA256_ARM64: 'e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080'
+  OSV_SCANNER_VERSION: '2.7.0'
+  OSV_SCANNER_SHA256_X64: '160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b'
+  OSV_SCANNER_SHA256_ARM64: '4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7'
+  SEMGREP_VERSION: '1.181.0'
+  CHECKOV_VERSION: '3.3.29'
+  PYYAML_VERSION: '6.0.2'
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository (full history, for secrets and DCO ranges)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the gate script
+        uses: actions/checkout@v5
+        with:
+          repository: syntropical/actions
+          ref: ${{ inputs.actions-ref }}
+          path: .secure-sdlc-tooling
+          persist-credentials: false
+
+      # Move the tooling out of the workspace: semgrep's diff-aware mode refuses
+      # to run with untracked files in the tree, and no scanner should see it.
+      - name: Move the gate script out of the workspace
+        run: mv .secure-sdlc-tooling "$RUNNER_TEMP/secure-sdlc-tooling"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Resolve the scan range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          base=""
+          if [ "$EVENT" = "pull_request" ] || [ "$EVENT" = "pull_request_target" ]; then
+            base=$(git merge-base "$PR_BASE" HEAD)
+          elif [ -n "${PUSH_BEFORE:-}" ] && ! [[ "$PUSH_BEFORE" =~ ^0+$ ]] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ -n "$base" ]; then
+            echo "scope=$(git rev-list --count "$base"..HEAD) commits since ${base:0:12}" >> "$GITHUB_OUTPUT"
+          else
+            echo "scope=full history" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install scanners (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/sdlc-bin"; mkdir -p "$bin"
+          case "$(uname -m)" in
+            x86_64|amd64) gl_arch=x64;   gl_sha=$GITLEAKS_SHA256_X64;   osv_arch=amd64; osv_sha=$OSV_SCANNER_SHA256_X64 ;;
+            aarch64|arm64) gl_arch=arm64; gl_sha=$GITLEAKS_SHA256_ARM64; osv_arch=arm64; osv_sha=$OSV_SCANNER_SHA256_ARM64 ;;
+            *) echo "::error::unsupported runner architecture $(uname -m)"; exit 1 ;;
+          esac
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gl_arch}.tar.gz"
+          echo "${gl_sha}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz -C "$bin" gitleaks
+          curl -fsSL -o "$bin/osv-scanner" "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_${osv_arch}"
+          echo "${osv_sha}  $bin/osv-scanner" | sha256sum -c -
+          chmod +x "$bin/osv-scanner" "$bin/gitleaks"
+          python -m venv "$RUNNER_TEMP/sdlc-venv"
+          "$RUNNER_TEMP/sdlc-venv/bin/pip" install --quiet --disable-pip-version-check \
+            "semgrep==${SEMGREP_VERSION}" "checkov==${CHECKOV_VERSION}" "pyyaml==${PYYAML_VERSION}"
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/sdlc-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Secrets (gitleaks)
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          set -euo pipefail
+          cfg=(); [ -f .gitleaks.toml ] && cfg=(--config .gitleaks.toml)
+          range=(); [ -n "$BASE" ] && range=(--log-opts "$BASE..HEAD")
+          gitleaks git "${cfg[@]}" "${range[@]}" --redact --no-banner \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks.json" --exit-code 0 .
+
+      - name: SAST (semgrep)
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+          CONFIGS: ${{ inputs.semgrep-config }}
+          EXCLUDES: ${{ inputs.sast-exclude }}
+        run: |
+          set -euo pipefail
+          args=(--json --output "$RUNNER_TEMP/semgrep.json" --metrics=off --quiet --disable-version-check)
+          for c in $CONFIGS; do args+=(--config "$c"); done
+          [ -d .semgrep ] && args+=(--config .semgrep)
+          for e in $EXCLUDES; do args+=(--exclude "$e"); done
+          [ -n "$BASE" ] && args+=(--baseline-commit "$BASE")
+          # Exit codes 0 (clean) and 1 (findings) are both success here; the gate decides.
+          rc=0; semgrep scan "${args[@]}" . || rc=$?
+          if [ "$rc" -gt 1 ]; then echo "::error::semgrep failed (exit $rc)"; exit "$rc"; fi
+
+      - name: Dependencies and licences (osv-scanner)
+        run: |
+          set -euo pipefail
+          rc=0
+          osv-scanner scan source --recursive --licenses --format json \
+            --output-file "$RUNNER_TEMP/osv.json" . || rc=$?
+          # 0 = clean, 1 = vulnerabilities found, 128 = no lockfiles/manifests found.
+          case "$rc" in
+            0|1) ;;
+            128) echo '{"results":[]}' > "$RUNNER_TEMP/osv.json"
+                 echo "::warning::osv-scanner found no lockfiles; dependency coverage is empty for this repo" ;;
+            *) echo "::error::osv-scanner failed (exit $rc)"; exit "$rc" ;;
+          esac
+
+      - name: IaC and container configuration (checkov)
+        if: inputs.enable-iac
+        run: |
+          set -euo pipefail
+          checkov -d . --quiet --compact --output json \
+            --skip-path node_modules --skip-path .venv --soft-fail \
+            --framework terraform dockerfile kubernetes github_actions \
+            > "$RUNNER_TEMP/checkov.json" || true
+          [ -s "$RUNNER_TEMP/checkov.json" ] || echo '[]' > "$RUNNER_TEMP/checkov.json"
+
+      - name: Commit sign-off (DCO) range
+        if: inputs.enable-dco && steps.range.outputs.base != ''
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          git log --no-merges --format='%H%x1f%P%x1f%s%x1f%B%x1e' "$BASE..HEAD" > "$RUNNER_TEMP/commits.txt"
+
+      - name: Evaluate the gate
+        env:
+          MODE: ${{ inputs.mode }}
+          BLOCK_AT: ${{ inputs.block-at }}
+          TRUSTED: ${{ inputs.trusted-action-owners }}
+          SCOPE: ${{ steps.range.outputs.scope }}
+          ENABLE_IAC: ${{ inputs.enable-iac }}
+          ENABLE_DCO: ${{ inputs.enable-dco }}
+          CONFIGS: ${{ inputs.semgrep-config }}
+        run: |
+          set -euo pipefail
+          python - <<'PY' > "$RUNNER_TEMP/coverage.json"
+          import json, os
+          v = os.environ
+          cov = [
+            {"gate": "secrets", "scanner": "gitleaks", "version": v["GITLEAKS_VERSION"], "scope": v["SCOPE"]},
+            {"gate": "sast", "scanner": "semgrep", "version": v["SEMGREP_VERSION"],
+             "scope": ("new findings vs PR base; " if "commits" in v["SCOPE"] else "whole tree; ") + v["CONFIGS"]},
+            {"gate": "sca", "scanner": "osv-scanner", "version": v["OSV_SCANNER_VERSION"], "scope": "all lockfiles, OSV database"},
+            {"gate": "licence", "scanner": "osv-scanner", "version": v["OSV_SCANNER_VERSION"], "scope": "declared dependency licences"},
+            {"gate": "actions-pinning", "scanner": "sdlc_gate", "version": "v1", "scope": ".github/workflows"},
+          ]
+          if v["ENABLE_IAC"] == "true":
+            cov.append({"gate": "iac", "scanner": "checkov", "version": v["CHECKOV_VERSION"],
+                        "scope": "terraform, dockerfile, kubernetes, github_actions"})
+          if v["ENABLE_DCO"] == "true" and "commits" in v["SCOPE"]:
+            cov.append({"gate": "dco", "scanner": "sdlc_gate", "version": "v1", "scope": v["SCOPE"]})
+          print(json.dumps(cov))
+          PY
+          args=(--mode "$MODE" --coverage "$RUNNER_TEMP/coverage.json"
+                --gitleaks "$RUNNER_TEMP/gitleaks.json" --semgrep "$RUNNER_TEMP/semgrep.json"
+                --osv "$RUNNER_TEMP/osv.json" --trusted-action-owners "$TRUSTED"
+                --evidence "$RUNNER_TEMP/sdlc-evidence.json")
+          [ -f "$RUNNER_TEMP/checkov.json" ] && args+=(--checkov "$RUNNER_TEMP/checkov.json")
+          [ -f "$RUNNER_TEMP/commits.txt" ] && args+=(--commits "$RUNNER_TEMP/commits.txt")
+          [ -n "$BLOCK_AT" ] && args+=(--block-at "$BLOCK_AT")
+          python "$RUNNER_TEMP/secure-sdlc-tooling/scripts/sdlc/sdlc_gate.py" "${args[@]}"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdlc-evidence
+          path: |
+            ${{ runner.temp }}/sdlc-evidence.json
+            ${{ runner.temp }}/coverage.json
+          retention-days: 400
+          if-no-files-found: warn
