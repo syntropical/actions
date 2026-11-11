@@ -1,0 +1,36 @@
+name: Security gates
+
+# Two governance mandates as executable assertions, run by governance's own reusable workflows
+# so every module runs the same scanner with the same patterns (PLAT-001):
+#
+#   secret-gate      DEVOPS-006 — every push is scanned for credentials over the objects it adds,
+#                    history included; an unscannable push is not a clean one.
+#   deploy-security  CRED-001..004 — deploy plumbing is scanned for hardcoded credentials,
+#                    plaintext secret env injection, client-bundle secrets and non-TLS transport.
+#
+# Both read governance with a token minted from this repository's App, scoped to governance.
+# NOT path-filtered: a path a filter excluded would be the one a secret could enter by.
+
+on:
+  pull_request:
+  push:
+    branches: [main, stage]
+
+permissions:
+  contents: read
+
+jobs:
+  secret-gate:
+    uses: syntropical/governance/.github/workflows/push-secret-gate.yml@main
+    with:
+      fail-on: high
+      app-id: ${{ vars.PLATFORM_SDK_APP_ID }}
+    secrets:
+      app-private-key: ${{ secrets.PLATFORM_SDK_APP_PRIVATE_KEY }}
+
+  deploy-security:
+    uses: syntropical/governance/.github/workflows/deploy-security.yml@main
+    with:
+      app-id: ${{ vars.PLATFORM_SDK_APP_ID }}
+    secrets:
+      app-private-key: ${{ secrets.PLATFORM_SDK_APP_PRIVATE_KEY }}
